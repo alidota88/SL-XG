@@ -6,8 +6,10 @@ import requests
 import pandas as pd
 from datetime import datetime
 from database import init_db
-from db_manager import get_data, save_data
+from db_manager import get_data
 from strategy import run_strategy
+# === 新增引入 ===
+from data_fetcher import backfill_data, fetch_daily_data
 
 # 配置信息
 TG_TOKEN = os.getenv("TG_TOKEN")
@@ -28,20 +30,20 @@ def send_telegram(message: str):
 
 def job_daily_selection():
     """
-    【核心任务】每日执行的选股流程
+    【核心任务】每日数据更新 + 选股
     """
     print(f"⏰ [Job] Starting daily task at {datetime.now()}...")
     
-    # 1. (重要) 这里必须接入真实数据源
-    # 比如：tushare_fetcher.fetch_today_data()
-    # 目前只是演示，如果没有数据，后面什么都做不了
+    # 1. 获取今日（或最新交易日）数据
+    # 为了保险，我们直接运行一次回补逻辑，它会自动补齐最近缺漏的几天
+    # 这样即使昨天机器人挂了，今天也能补回来
+    backfill_data(lookback_days=5) 
     
-    # 2. 从数据库读取数据
+    # 2. 从数据库读取数据 (150天用于计算均线)
     df = get_data(n_days=150)
     
     if df.empty:
-        print("⚠️ [Job] No data found.")
-        send_telegram("⚠️ **机器人警报**\n\n数据库为空，无法执行选股。\n请检查数据获取模块。")
+        send_telegram("⚠️ **机器人警报**\n\n数据库为空，选股失败。")
         return
 
     # 3. 运行策略
@@ -51,42 +53,55 @@ def job_daily_selection():
     current_date = datetime.now().strftime("%Y-%m-%d")
     if not results.empty:
         msg = [f"🤖 **选股日报 ({current_date})**", "---"]
-        for _, row in results.iterrows():
-            msg.append(f"✅ `{row['ts_code']}` | 收盘: {row['close']}")
-        msg.append("\n⚠️ *入市需谨慎*")
+        msg.append(f"📊 策略：缩量回调 + 60日线支撑")
+        msg.append(f"🎯 选中 {len(results)} 只标的：\n")
+        
+        # 限制消息长度，防止超过 Telegram 限制
+        top_results = results.head(20) 
+        
+        for _, row in top_results.iterrows():
+            code = row['ts_code']
+            price = row['close']
+            vol = row['vol']
+            # 这里可以加个链接跳转到财经网站
+            link = f"http://quote.eastmoney.com/{'sh' if code.endswith('.SH') else 'sz'}{code[:6]}.html"
+            msg.append(f"[{code}]({link}) | 💰 {price}")
+            
+        if len(results) > 20:
+            msg.append(f"\n... 以及其他 {len(results)-20} 只")
+            
+        msg.append("\n⚠️ *入市需谨慎，仅供参考*")
         send_telegram("\n".join(msg))
     else:
         print("ℹ️ [Job] No stocks selected.")
-        send_telegram(f"🤖 **选股日报 ({current_date})**\n\n今日无标的入选。")
+        send_telegram(f"🤖 **选股日报 ({current_date})**\n\n今日无符合策略的标的。")
     
     print("✅ [Job] Task finished.")
 
 def main():
-    print("🚀 [System] Stock Quant Bot is running in Daemon Mode...")
+    print("🚀 [System] Stock Quant Bot is running...")
     
-    # 初始化数据库
+    # 1. 初始化数据库表结构
     init_db()
     
-    # 发送一条启动通知，确认服务重启成功
-    send_telegram("🚀 **机器人已上线**\n正在等待预定时间执行任务...")
+    # 2. 启动时自检：如果是新环境，先下载历史数据
+    # 检查过去 100 天的数据，如果缺失会自动补全
+    # 第一次运行这步会花几分钟（下载约50万行数据）
+    print("🔄 [System] Checking data integrity...")
+    backfill_data(lookback_days=100) 
+    
+    send_telegram("🚀 **机器人已上线**\n历史数据自检完成，等待每日任务...")
 
     # === 设定定时任务 ===
-    # Railway 服务器通常是 UTC 时间。
-    # 北京时间 15:30 = UTC 07:30
-    # 北京时间 18:00 = UTC 10:00
+    # Tushare 数据通常在收盘后 16:00 左右更新稳定
+    # 北京时间 16:30 = UTC 08:30
+    schedule.every().day.at("08:30").do(job_daily_selection)
     
-    # 设定每天 UTC 07:30 (北京 15:30) 执行
-    schedule.every().day.at("07:30").do(job_daily_selection)
-    
-    # 如果你想测试，可以把下面这行注释取消，每 2 分钟跑一次（测试完记得注释掉！）
-    # schedule.every(2).minutes.do(job_daily_selection)
+    print("🕒 [System] Scheduler is active (Daily at 08:30 UTC).")
 
-    print("🕒 [System] Scheduler is active. Waiting for next run...")
-
-    # === 死循环：保持程序一直活着 ===
     while True:
         schedule.run_pending()
-        time.sleep(60) # 每分钟检查一次，节省 CPU
+        time.sleep(60)
 
 if __name__ == "__main__":
     main()
