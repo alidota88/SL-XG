@@ -4,49 +4,87 @@ import time
 import tushare as ts
 import pandas as pd
 from datetime import datetime, timedelta
-from sqlalchemy import text
 from db_manager import save_data, engine
 
-# 初始化 Tushare Pro
-TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN")
-pro = ts.pro_api(TUSHARE_TOKEN)
+# 初始化 Tushare
+TS_TOKEN = os.getenv("TS_TOKEN")
+if TS_TOKEN:
+    ts.set_token(TS_TOKEN)
+    pro = ts.pro_api()
+else:
+    print("⚠️ [Data Fetcher] TS_TOKEN not found. Data fetching will fail.")
+    pro = None
 
 def fetch_daily_data(trade_date: str):
     """
-    获取指定日期的全市场行情并存入数据库
+    获取指定日期的全市场行情
     :param trade_date: 格式 'YYYYMMDD'
     """
-    print(f"📥 [Tushare] Fetching data for {trade_date}...")
+    if not pro:
+        return
     
+    print(f"⬇️ [Tushare] Fetching data for {trade_date}...")
     try:
-        # 1. 获取日线行情 (2000积分用户可以直接拉取全市场)
-        # 字段说明: ts_code(代码), trade_date(日期), open, high, low, close, vol(成交量)
+        # 获取日线行情
         df = pro.daily(trade_date=trade_date)
         
         if df.empty:
-            print(f"⚠️ [Tushare] No trading data for {trade_date} (Holiday?).")
-            return 0
+            print(f"⚠️ [Tushare] No data for {trade_date} (Holiday?).")
+            return
 
-        # 2. 简单的清洗
-        # 我们的数据库字段叫 'vol'，Tushare 返回的也是 'vol'，无需重命名
-        # Tushare 的 vol 单位是 "手"，如果要转为 "股" 可以 * 100，这里保持原样即可
+        # 数据清洗：重命名列以匹配我们的数据库模型
+        # Tushare 返回: ts_code, trade_date, open, high, low, close, pre_close, change, pct_chg, vol, amount
+        # 我们的数据库: ts_code, trade_date, open, high, low, close, vol
         
-        # 3. 存入数据库
-        save_data(df)
-        return len(df)
-
+        # 转换日期格式 YYYYMMDD -> YYYY-MM-DD
+        df['trade_date'] = pd.to_datetime(df['trade_date'])
+        
+        # 保存入库
+        save_data(df[['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'vol']])
+        
     except Exception as e:
         print(f"❌ [Tushare] Error fetching {trade_date}: {e}")
-        return 0
+        # 遇到错误休息一下，防止被封 IP
+        time.sleep(1)
 
-def backfill_history(start_date: str, end_date: str):
+def backfill_data(lookback_days: int = 100):
     """
-    【初始化专用】补全历史数据
-    :param start_date: 'YYYYMMDD'
-    :param end_date: 'YYYYMMDD'
+    数据回补：检查并下载过去 N 天的数据
     """
-    print(f"🔄 [Data Fetcher] Starting backfill from {start_date} to {end_date}...")
+    print(f"🔄 [Data Fetcher] Starting backfill for last {lookback_days} days...")
     
-    # 获取交易日历，只在开盘日抓取
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=lookback_days)
+    
+    # 生成日期序列
+    date_range = pd.date_range(start=start_date, end=end_date)
+    
+    # 获取数据库里已有的最新日期，避免重复下载
     try:
-        cal_df = pro.trade_cal(exchange='', start_date=start_date, end_date
+        query = "SELECT MAX(trade_date) FROM stock_daily"
+        last_db_date = pd.read_sql(query, engine).iloc[0, 0]
+        if last_db_date:
+             # 如果是 date 类型，转为 datetime
+            last_db_date = pd.to_datetime(last_db_date)
+            print(f"ℹ️ [Data Fetcher] Database updated until: {last_db_date.date()}")
+        else:
+            print("ℹ️ [Data Fetcher] Database is empty.")
+            last_db_date = pd.to_datetime("2000-01-01") # 极早的时间
+    except Exception:
+        last_db_date = pd.to_datetime("2000-01-01")
+
+    count = 0
+    for date in date_range:
+        # 如果该日期比数据库最新日期还早，跳过
+        if date <= last_db_date:
+            continue
+            
+        date_str = date.strftime('%Y%m%d')
+        fetch_daily_data(date_str)
+        count += 1
+        
+        # Tushare 限制每分钟访问次数，这里稍微 sleep 一下比较安全
+        # 2000积分通常每分钟允许 500-800 次，非常充裕，但加上 sleep 0.3 更稳健
+        time.sleep(0.3) 
+
+    print(f"✅ [Data Fetcher] Backfill complete. Downloaded {count} days.")
