@@ -11,3 +11,4 @@ requests>=2.26.0
 
 # 环境变量支持 (本地开发用，Railway会自动注入)
 python-dotenv
+schedule
