@@ -12,79 +12,58 @@ if TS_TOKEN:
     ts.set_token(TS_TOKEN)
     pro = ts.pro_api()
 else:
-    print("⚠️ [Data Fetcher] TS_TOKEN not found. Data fetching will fail.")
+    print("⚠️ [Data Fetcher] TS_TOKEN not found.")
     pro = None
 
-def fetch_daily_data(trade_date: str):
+def fetch_daily_data(trade_date_str: str):
     """
-    获取指定日期的全市场行情
-    :param trade_date: 格式 'YYYYMMDD'
+    下载单日数据
     """
-    if not pro:
-        return
+    if not pro: return
     
-    print(f"⬇️ [Tushare] Fetching data for {trade_date}...")
+    print(f"⬇️ [Tushare] Fetching {trade_date_str}...", flush=True)
     try:
-        # 获取日线行情
-        df = pro.daily(trade_date=trade_date)
-        
+        # 获取日线
+        df = pro.daily(trade_date=trade_date_str)
         if df.empty:
-            print(f"⚠️ [Tushare] No data for {trade_date} (Holiday?).")
+            print(f"   ⚠️ No data for {trade_date_str} (Weekend/Holiday?)")
             return
 
-        # 数据清洗：重命名列以匹配我们的数据库模型
-        # Tushare 返回: ts_code, trade_date, open, high, low, close, pre_close, change, pct_chg, vol, amount
-        # 我们的数据库: ts_code, trade_date, open, high, low, close, vol
-        
-        # 转换日期格式 YYYYMMDD -> YYYY-MM-DD
+        # 稍微清洗一下
         df['trade_date'] = pd.to_datetime(df['trade_date'])
         
-        # 保存入库
+        # 存入数据库 (db_manager 会自动处理重复，所以这里放心存)
         save_data(df[['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'vol']])
         
     except Exception as e:
-        print(f"❌ [Tushare] Error fetching {trade_date}: {e}")
-        # 遇到错误休息一下，防止被封 IP
+        print(f"❌ [Tushare] Error {trade_date_str}: {e}")
         time.sleep(1)
 
-def backfill_data(lookback_days: int = 100):
+def backfill_data(lookback_days: int = 200):
     """
-    数据回补：检查并下载过去 N 天的数据
+    【智能回补】
+    不依赖数据库的最新日期，而是强制扫描过去 N 天，
+    缺哪天就补哪天。
     """
-    print(f"🔄 [Data Fetcher] Starting backfill for last {lookback_days} days...")
+    print(f"🔄 [Data Fetcher] Checking data completeness for last {lookback_days} days...")
     
     end_date = datetime.now()
     start_date = end_date - timedelta(days=lookback_days)
     
-    # 生成日期序列
-    date_range = pd.date_range(start=start_date, end=end_date)
+    # 1. 生成目标日期范围（我们要这期间的所有数据）
+    target_dates = pd.date_range(start=start_date, end=end_date).strftime('%Y-%m-%d').tolist()
     
-    # 获取数据库里已有的最新日期，避免重复下载
+    # 2. 查询数据库里已经有哪些日期了
     try:
-        query = "SELECT MAX(trade_date) FROM stock_daily"
-        last_db_date = pd.read_sql(query, engine).iloc[0, 0]
-        if last_db_date:
-             # 如果是 date 类型，转为 datetime
-            last_db_date = pd.to_datetime(last_db_date)
-            print(f"ℹ️ [Data Fetcher] Database updated until: {last_db_date.date()}")
+        query = f"SELECT DISTINCT trade_date FROM stock_daily WHERE trade_date >= '{start_date.strftime('%Y-%m-%d')}'"
+        existing_df = pd.read_sql(query, engine)
+        if not existing_df.empty:
+            # 转成字符串列表方便比对
+            existing_dates = existing_df['trade_date'].astype(str).tolist()
         else:
-            print("ℹ️ [Data Fetcher] Database is empty.")
-            last_db_date = pd.to_datetime("2000-01-01") # 极早的时间
-    except Exception:
-        last_db_date = pd.to_datetime("2000-01-01")
+            existing_dates = []
+    except Exception as e:
+        print(f"⚠️ DB Read Error: {e}, assuming empty.")
+        existing_dates = []
 
-    count = 0
-    for date in date_range:
-        # 如果该日期比数据库最新日期还早，跳过
-        if date <= last_db_date:
-            continue
-            
-        date_str = date.strftime('%Y%m%d')
-        fetch_daily_data(date_str)
-        count += 1
-        
-        # Tushare 限制每分钟访问次数，这里稍微 sleep 一下比较安全
-        # 2000积分通常每分钟允许 500-800 次，非常充裕，但加上 sleep 0.3 更稳健
-        time.sleep(0.3) 
-
-    print(f"✅ [Data Fetcher] Backfill complete. Downloaded {count} days.")
+    existing_set = set(exis
