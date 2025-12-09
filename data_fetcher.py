@@ -66,4 +66,31 @@ def backfill_data(lookback_days: int = 200):
         print(f"⚠️ DB Read Error: {e}, assuming empty.")
         existing_dates = []
 
-    existing_set = set(exis
+    # === 【修复点】之前这里少写了括号和变量名 ===
+    existing_set = set(existing_dates)
+    # ==========================================
+    
+    # 3. 找出缺失的日期
+    missing_dates = [d for d in target_dates if d not in existing_set]
+    
+    # 按时间正序下载
+    missing_dates.sort()
+    
+    print(f"📊 Analysis: Need {lookback_days} days. Found {len(existing_dates)} days. Missing {len(missing_dates)} days.")
+    
+    if not missing_dates:
+        print("✅ Data is complete! No download needed.")
+        return
+
+    print(f"⬇️ Starting download for {len(missing_dates)} missing days...")
+    
+    # 4. 循环下载
+    for date_str in missing_dates:
+        # 格式化为 YYYYMMDD 给 Tushare
+        ts_date = date_str.replace("-", "")
+        fetch_daily_data(ts_date)
+        
+        # 稍微控制频率
+        time.sleep(0.3)
+
+    print("✅ [Data Fetcher] Backfill complete.")
