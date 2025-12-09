@@ -1,48 +1,48 @@
 # db_manager.py
 import pandas as pd
+from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import insert
 from database import engine
 
-def insert_on_conflict_nothing(table, conn, keys, data_iter):
+def upsert_method(table, conn, keys, data_iter):
     """
-    PostgreSQL 专用插入方法：遇到主键冲突（重复数据）时自动忽略，不报错
+    PostgreSQL 专用：批量写入时，如果主键冲突则忽略（保留已有数据），
+    确保程序不会因为某一天数据已存在而崩溃停止。
     """
     data = [dict(zip(keys, row)) for row in data_iter]
     if not data:
         return
 
-    # 构造插入语句
     stmt = insert(table.table).values(data)
-    
-    # 冲突处理：DO NOTHING
+    # 核心：遇到 (ts_code, trade_date) 冲突，什么都不做，继续下一条
     stmt = stmt.on_conflict_do_nothing(index_elements=['ts_code', 'trade_date'])
-    
-    # 执行
     conn.execute(stmt)
 
 def save_data(df: pd.DataFrame):
     """
-    保存数据到数据库（防崩溃版）
+    保存数据，带防崩溃机制
     """
     if df.empty:
         return
 
     try:
-        # 使用自定义的 method 防止重复报错
         df.to_sql(
             'stock_daily', 
             engine, 
             if_exists='append', 
             index=False, 
-            chunksize=1000, 
-            method=insert_on_conflict_nothing 
+            chunksize=2000, 
+            method=upsert_method # 使用上面的防崩溃方法
         )
-        print(f"✅ [DB Manager] Processed {len(df)} rows (duplicates ignored).")
+        # 不打印啰嗦日志，只报错时说话
     except Exception as e:
-        print(f"❌ [DB Manager] Save failed: {e}")
+        print(f"❌ [DB Error] Save failed: {e}")
 
-def get_data(n_days: int = 100) -> pd.DataFrame:
-    """读取数据"""
+def get_data(n_days: int = 250) -> pd.DataFrame:
+    """
+    读取足够长的数据以计算均线
+    """
+    # 强制取最近 250 天，保证 MA60, MA120 都能算出来
     query = f"""
     SELECT * FROM stock_daily 
     WHERE trade_date >= current_date - INTERVAL '{n_days} days'
@@ -54,5 +54,14 @@ def get_data(n_days: int = 100) -> pd.DataFrame:
             df['trade_date'] = pd.to_datetime(df['trade_date'])
         return df
     except Exception as e:
-        print(f"❌ [DB Manager] Load failed: {e}")
+        print(f"❌ [DB Error] Load failed: {e}")
         return pd.DataFrame()
+
+def check_data_count():
+    """查看数据库现在到底有多少行，心中有数"""
+    try:
+        with engine.connect() as conn:
+            cnt = conn.execute(text("SELECT count(*) FROM stock_daily")).scalar()
+            return cnt
+    except:
+        return 0
