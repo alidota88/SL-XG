@@ -6,7 +6,6 @@ import pandas as pd
 from datetime import datetime, timedelta
 from db_manager import save_data, engine
 
-# 初始化 Tushare
 TS_TOKEN = os.getenv("TS_TOKEN")
 if TS_TOKEN:
     ts.set_token(TS_TOKEN)
@@ -17,48 +16,51 @@ else:
 
 def fetch_daily_data(trade_date_str: str):
     """
-    下载单日数据
+    下载单日数据 (带重试机制)
     """
     if not pro: return
     
-    print(f"⬇️ [Tushare] Fetching {trade_date_str}...", flush=True)
-    try:
-        # 获取日线
-        df = pro.daily(trade_date=trade_date_str)
-        if df.empty:
-            print(f"   ⚠️ No data for {trade_date_str} (Weekend/Holiday?)")
-            return
+    # === 重试机制 ===
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            print(f"⬇️ [Tushare] Fetching {trade_date_str} (Attempt {attempt+1}/{max_retries})...", flush=True)
+            
+            df = pro.daily(trade_date=trade_date_str)
+            
+            if df.empty:
+                print(f"   ⚠️ No data for {trade_date_str} (Weekend/Holiday?)")
+                return # 空数据通常是因为休市，不用重试
 
-        # 稍微清洗一下
-        df['trade_date'] = pd.to_datetime(df['trade_date'])
-        
-        # 存入数据库 (db_manager 会自动处理重复，所以这里放心存)
-        save_data(df[['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'vol']])
-        
-    except Exception as e:
-        print(f"❌ [Tushare] Error {trade_date_str}: {e}")
-        time.sleep(1)
+            df['trade_date'] = pd.to_datetime(df['trade_date'])
+            save_data(df[['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'vol']])
+            
+            # 成功了就退出循环
+            return 
+            
+        except Exception as e:
+            print(f"   ❌ Error on attempt {attempt+1}: {e}")
+            if attempt < max_retries - 1:
+                print("   ⏳ Waiting 5 seconds to retry...")
+                time.sleep(5)
+            else:
+                print(f"   ❌ Failed to fetch {trade_date_str} after {max_retries} attempts.")
 
 def backfill_data(lookback_days: int = 200):
     """
-    【智能回补】
-    不依赖数据库的最新日期，而是强制扫描过去 N 天，
-    缺哪天就补哪天。
+    智能补漏：只下载数据库里缺少的日期
     """
     print(f"🔄 [Data Fetcher] Checking data completeness for last {lookback_days} days...")
     
     end_date = datetime.now()
     start_date = end_date - timedelta(days=lookback_days)
     
-    # 1. 生成目标日期范围（我们要这期间的所有数据）
     target_dates = pd.date_range(start=start_date, end=end_date).strftime('%Y-%m-%d').tolist()
     
-    # 2. 查询数据库里已经有哪些日期了
     try:
         query = f"SELECT DISTINCT trade_date FROM stock_daily WHERE trade_date >= '{start_date.strftime('%Y-%m-%d')}'"
         existing_df = pd.read_sql(query, engine)
         if not existing_df.empty:
-            # 转成字符串列表方便比对
             existing_dates = existing_df['trade_date'].astype(str).tolist()
         else:
             existing_dates = []
@@ -66,17 +68,11 @@ def backfill_data(lookback_days: int = 200):
         print(f"⚠️ DB Read Error: {e}, assuming empty.")
         existing_dates = []
 
-    # === 【修复点】之前这里少写了括号和变量名 ===
     existing_set = set(existing_dates)
-    # ==========================================
-    
-    # 3. 找出缺失的日期
     missing_dates = [d for d in target_dates if d not in existing_set]
-    
-    # 按时间正序下载
     missing_dates.sort()
     
-    print(f"📊 Analysis: Need {lookback_days} days. Found {len(existing_dates)} days. Missing {len(missing_dates)} days.")
+    print(f"📊 Analysis: Missing {len(missing_dates)} days out of {lookback_days}.")
     
     if not missing_dates:
         print("✅ Data is complete! No download needed.")
@@ -84,13 +80,9 @@ def backfill_data(lookback_days: int = 200):
 
     print(f"⬇️ Starting download for {len(missing_dates)} missing days...")
     
-    # 4. 循环下载
     for date_str in missing_dates:
-        # 格式化为 YYYYMMDD 给 Tushare
         ts_date = date_str.replace("-", "")
         fetch_daily_data(ts_date)
-        
-        # 稍微控制频率
-        time.sleep(0.3)
+        time.sleep(0.5) # 稍微慢一点，保护接口
 
     print("✅ [Data Fetcher] Backfill complete.")
