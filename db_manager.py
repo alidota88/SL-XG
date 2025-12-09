@@ -1,34 +1,57 @@
 # db_manager.py
 import pandas as pd
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.dialects.postgresql import insert
 from database import engine
+
+def insert_on_conflict_nothing(table, conn, keys, data_iter):
+    """
+    自定义的 Pandas to_sql 插入方法
+    使用 PostgreSQL 的 ON CONFLICT DO NOTHING 语法
+    """
+    # 将迭代器转换为字典列表
+    data = [dict(zip(keys, row)) for row in data_iter]
+    
+    if not data:
+        return
+
+    # 构建 INSERT 语句
+    stmt = insert(table.table).values(data)
+    
+    # 定义冲突时的动作：什么都不做 (DO NOTHING)
+    # 注意：这里假设你的主键是 ts_code 和 trade_date
+    stmt = stmt.on_conflict_do_nothing(index_elements=['ts_code', 'trade_date'])
+    
+    # 执行语句
+    conn.execute(stmt)
 
 def save_data(df: pd.DataFrame):
     """
-    将 DataFrame 保存到数据库
-    :param df: 包含行情数据的 DataFrame，列名需与数据库字段对应
+    将 DataFrame 保存到数据库 (自动去重)
+    :param df: 包含行情数据的 DataFrame
     """
     if df.empty:
-        print("⚠️ [DB Manager] No data to save.")
         return
 
     try:
-        # 使用 append 模式，如果数据量大建议改用 method='multi' 加速
-        # 注意：生产环境通常需要处理主键冲突（Upsert），这里简化为追加
-        # 实际使用中请确保传入的数据不包含库中已有的 (code, date)
-        df.to_sql('stock_daily', engine, if_exists='append', index=False, chunksize=1000)
-        print(f"✅ [DB Manager] Successfully saved {len(df)} rows.")
+        # 使用自定义的 method 参数处理冲突
+        # chunksize 设置为 1000 防止 SQL 语句过长
+        df.to_sql(
+            'stock_daily', 
+            engine, 
+            if_exists='append', 
+            index=False, 
+            chunksize=1000, 
+            method=insert_on_conflict_nothing
+        )
+        print(f"✅ [DB Manager] Successfully processed {len(df)} rows (duplicates ignored).")
     except Exception as e:
         print(f"❌ [DB Manager] Save failed: {e}")
 
 def get_data(n_days: int = 100) -> pd.DataFrame:
     """
-    获取最近 N 天的数据用于策略计算
-    :param n_days: 回溯天数（需预留足够的计算均线的 Buffer）
+    获取最近 N 天的所有股票数据
     """
-    # 这里使用简单的日期过滤。实际交易日可能少于自然日，建议取稍微大一点的范围
-    # 比如要计算60日均线，最好取最近120个自然日的数据
-    
+    # 增加 LIMIT 防止内存溢出，但对于 100 天数据通常不需要
     query = f"""
     SELECT * FROM stock_daily 
     WHERE trade_date >= current_date - INTERVAL '{n_days} days'
@@ -37,8 +60,8 @@ def get_data(n_days: int = 100) -> pd.DataFrame:
     
     try:
         df = pd.read_sql(query, engine)
-        # 确保日期格式正确
-        df['trade_date'] = pd.to_datetime(df['trade_date'])
+        if not df.empty:
+            df['trade_date'] = pd.to_datetime(df['trade_date'])
         print(f"✅ [DB Manager] Loaded {len(df)} rows from database.")
         return df
     except Exception as e:
