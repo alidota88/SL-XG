@@ -22,50 +22,52 @@ def send_telegram(message):
 
 def execute_logic(is_test=False):
     print("------------------------------------------------")
-    print(f"🔥 [Execution] Starting Logic... (Test Mode: {is_test})")
+    print(f"🔥 [Execution] Starting Weighted Strategy... (Test Mode: {is_test})")
     
-    row_count = check_data_count()
-    print(f"📊 Current DB Rows: {row_count}")
-    
-    # === 关键修改：为了修复缺失的几天，强制每次启动都检查过去 200 天 ===
-    # 之前是行数够了就不检查，现在改为：只要是测试启动，必须检查完整性
+    # 1. 数据完整性检查 (每次启动都强制检查200天，确保无死角)
     print("🛡️ Verifying data integrity for the last 200 days...")
     backfill_data(lookback_days=200)
     
     # 2. 读取数据
-    print("📉 Loading data for strategy...")
+    print("📉 Loading data...")
     df = get_data(n_days=250)
     
     if df.empty:
         send_telegram("❌ 错误：数据库为空。")
         return
 
-    # 3. 运行策略
-    print("🧠 Calculating Strategy...")
+    # 3. 运行加权评分策略
+    print("🧠 Calculating Weighted Scores...")
     results = run_strategy(df)
     
     # 4. 发送结果
     date_str = datetime.now().strftime("%Y-%m-%d")
     
     if not results.empty:
-        # 选出 555 只太多了，说明大盘在底部，策略过滤太松
-        # 我们只发前 20 只分数最高的
-        top = results.head(20)
-        msg = [f"🤖 **量化选股结果** ({date_str})", f"✅ 策略执行成功，共选出 {len(results)} 只", "---"]
-        for _, row in top.iterrows():
-            line = f"`{row['ts_code']}` 💰{row['close']:.2f}\nℹ️ {row['reason']}"
+        # 【关键】只取前 10 名
+        top = results.head(10)
+        
+        msg = [f"🏆 **量化选股 TOP 10** ({date_str})", "---"]
+        msg.append(f"📊 策略：加权评分 (Flexible版)")
+        msg.append(f"✅ 总入选：{len(results)} 只 (分数线 65+)\n")
+        
+        for i, (_, row) in enumerate(top.iterrows()):
+            # Emoji 排名
+            rank_icon = "🥇" if i==0 else "🥈" if i==1 else "🥉" if i==2 else f"{i+1}."
+            
+            line = (
+                f"{rank_icon} `{row['ts_code']}` 💰{row['close']:.2f}\n"
+                f"   **总分: {row['总分']:.0f}** (核心: {row['核心条件分']})\n"
+                f"   📉 量比min: {row['vol_to_min']:.2f} | 偏离: {abs(row['distance_ma60']):.1f}%"
+            )
             msg.append(line)
         
-        # 如果选出太多，提示一下
-        if len(results) > 20:
-            msg.append(f"\n...以及其他 {len(results)-20} 只")
-            
         send_telegram("\n".join(msg))
-        print(f"✅ Result sent. Selected {len(results)} stocks.")
+        print(f"✅ Result sent. Top 10 stocks selected.")
     else:
-        msg = f"🤖 **量化选股结果** ({date_str})\n\n策略运行正常，但今日无标的满足条件。"
+        msg = f"🏆 **量化选股结果** ({date_str})\n\n今日无股票达到及格线 (65分)。\n市场可能处于非缩量期或反弹期。"
         send_telegram(msg)
-        print("✅ Strategy finished. No stocks selected.")
+        print("✅ Strategy finished. No stocks qualified.")
     print("------------------------------------------------")
 
 def main():
