@@ -24,29 +24,19 @@ def execute_logic(is_test=False):
     print("------------------------------------------------")
     print(f"🔥 [Execution] Starting Logic... (Test Mode: {is_test})")
     
-    # 1. 检查数据量
     row_count = check_data_count()
     print(f"📊 Current DB Rows: {row_count}")
     
-    # 【核心修正】：阈值上调到 50万行 (约等于100天数据)
-    # 如果少于50万行，说明历史数据不够计算 MA60，必须强制补下载
-    if row_count < 500000:
-        print(f"⚠️ Data insufficient ({row_count} < 500,000). Forcing 200-day backfill...")
-        send_telegram(f"🔄 检测到历史数据不足 (当前仅{row_count}行)，正在下载近200天行情，耗时较长请耐心等待...")
-        
-        # 强制回补 200 天
-        backfill_data(lookback_days=200)
-    else:
-        print("✅ Data seems sufficient. Running daily update...")
-        # 日常只需补 5 天
-        backfill_data(lookback_days=5)
-
-    # 2. 读取数据 (计算60日线必须足够长)
+    # === 关键修改：为了修复缺失的几天，强制每次启动都检查过去 200 天 ===
+    # 之前是行数够了就不检查，现在改为：只要是测试启动，必须检查完整性
+    print("🛡️ Verifying data integrity for the last 200 days...")
+    backfill_data(lookback_days=200)
+    
+    # 2. 读取数据
     print("📉 Loading data for strategy...")
     df = get_data(n_days=250)
     
     if df.empty:
-        print("❌ Error: DB is empty.")
         send_telegram("❌ 错误：数据库为空。")
         return
 
@@ -58,24 +48,21 @@ def execute_logic(is_test=False):
     date_str = datetime.now().strftime("%Y-%m-%d")
     
     if not results.empty:
-        # 只取前 20 只
+        # 选出 555 只太多了，说明大盘在底部，策略过滤太松
+        # 我们只发前 20 只分数最高的
         top = results.head(20)
         msg = [f"🤖 **量化选股结果** ({date_str})", f"✅ 策略执行成功，共选出 {len(results)} 只", "---"]
         for _, row in top.iterrows():
             line = f"`{row['ts_code']}` 💰{row['close']:.2f}\nℹ️ {row['reason']}"
             msg.append(line)
         
+        # 如果选出太多，提示一下
+        if len(results) > 20:
+            msg.append(f"\n...以及其他 {len(results)-20} 只")
+            
         send_telegram("\n".join(msg))
         print(f"✅ Result sent. Selected {len(results)} stocks.")
     else:
-        # 调试信息：如果没有选出股票，打印一下是因为什么
-        print("ℹ️ No stocks selected. Debugging...")
-        if 'ma_60' in df.columns:
-            valid_ma = df['ma_60'].notnull().sum()
-            print(f"   Stocks with valid MA60: {valid_ma} / {len(df)}")
-            if valid_ma == 0:
-                print("   ❌ CRITICAL: All MA60 are NaN. History data is still too short!")
-        
         msg = f"🤖 **量化选股结果** ({date_str})\n\n策略运行正常，但今日无标的满足条件。"
         send_telegram(msg)
         print("✅ Strategy finished. No stocks selected.")
