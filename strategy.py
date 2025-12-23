@@ -4,17 +4,18 @@ import numpy as np
 import warnings
 warnings.filterwarnings('ignore')
 
-class WeightedScoringStrategy:
+class ShrinkBreakoutStrategy:
     """
-    加权评分策略 (极致缩量版)
-    必要前提(一票否决): 
-    1. 当日收盘价 < 开盘价 (假阴真阳或纯阴线)
-    2. 当日成交量 < 前20天(不含当日)最低成交量的 80%
+    极致缩量后起爆策略
+    
+    逻辑：
+    1. 历史回溯：过去20天内（不含今日），是否存在过【极致缩量日】。
+       - 极致缩量日定义：收盘<开盘 (绿盘) 且 成交量 < 前20天(不含当日)最低成交量的 90%。
+    2. 今日触发：突然放量上涨，收大阳线。
     """
     
-    def __init__(self, version='strict_shrink'):
+    def __init__(self, version='breakout_v1'):
         self.version = version
-        # 既然条件这么苛刻，一旦入选通常值得关注，分数线设为60即可
         self.params = {'min_score': 60} 
     
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -24,31 +25,36 @@ class WeightedScoringStrategy:
         
         df = df.sort_values(['ts_code', 'trade_date'])
         
-        # === 基础指标 ===
+        # === 1. 基础指标 ===
+        df['ma_5'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(5).mean())
+        df['ma_20'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(20).mean())
         df['ma_60'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(60).mean())
         
-        # === 关键：成交量计算 ===
+        # 成交量均线
+        df['vol_ma5'] = df.groupby('ts_code')['volume'].transform(lambda x: x.rolling(5).mean())
         df['vol_ma20'] = df.groupby('ts_code')['volume'].transform(lambda x: x.rolling(20).mean())
         
-        # 计算前20天(不含今天)的最低成交量
-        # shift(1) 将数据下移一位，确保 rolling(20) 取到的是昨天及之前的20天
-        df['prev_vol_min_20'] = df.groupby('ts_code')['volume'].transform(
+        df['pct_change'] = df.groupby('ts_code')['close'].transform(lambda x: x.pct_change() * 100)
+        
+        # === 2. 核心：识别历史上的“极致缩量日” ===
+        
+        # A. 计算每一天其“前20天（不含当日）”的最低成交量
+        df['prev_20_min_vol'] = df.groupby('ts_code')['volume'].transform(
             lambda x: x.shift(1).rolling(20).min()
         )
         
-        # === 辅助指标 ===
-        # 振幅
-        df['amplitude'] = (df['high'] - df['low']) / df['low'] * 100
-        df['amp_ma15'] = df.groupby('ts_code')['amplitude'].transform(lambda x: x.rolling(15).mean())
+        # B. 标记哪一天是“极致缩量日” (True/False)
+        # 条件：绿盘 (close < open) 且 量 < 前20天最低量的 90%
+        # 注意：这里按你的要求改成了 0.9
+        condition_shrink = (df['close'] < df['open']) & (df['volume'] < 0.9 * df['prev_20_min_vol'])
+        df['is_shrink_day'] = condition_shrink
         
-        # 涨跌幅
-        df['pct_change'] = df.groupby('ts_code')['close'].transform(lambda x: x.pct_change() * 100)
-        
-        # 均线距离
-        df['distance_ma60'] = (df['close'] - df['ma_60']) / df['ma_60'] * 100
-        
-        # 量比 (用于后续显示，非核心判断，因为核心判断用绝对值比对)
-        df['vol_ratio'] = df['volume'] / df['vol_ma20']
+        # C. 统计过去20天内（不含今天）是否有过“极致缩量日”
+        # 使用 shift(1) 将窗口向后移一天，确保不包含今天
+        # rolling(20).sum() > 0 表示过去20天里至少有一天满足条件
+        df['has_shrink_in_past_20'] = df.groupby('ts_code')['is_shrink_day'].transform(
+            lambda x: x.shift(1).rolling(20).sum()
+        )
         
         return df
     
@@ -56,112 +62,96 @@ class WeightedScoringStrategy:
         scores = {}
         
         # ==========================================
-        # === 0. 必要前提条件 (一票否决) ===
+        # === 0. 必要前提 (一票否决) ===
         # ==========================================
         
-        # 条件1: 必须是绿的 (收盘价 < 开盘价)
-        if row['close'] >= row['open']:
+        # 条件1: 过去20天内必须出现过极致缩量信号
+        if pd.isnull(row['has_shrink_in_past_20']) or row['has_shrink_in_past_20'] < 1:
             scores['总分'] = 0
-            scores['淘汰原因'] = '非绿盘'
+            scores['淘汰原因'] = '近期无缩量信号'
+            return scores
+
+        # 条件2: 今天必须是红盘 (收盘 > 开盘) 且是上涨的
+        if row['close'] <= row['open'] or row['pct_change'] <= 0:
+            scores['总分'] = 0
+            scores['淘汰原因'] = '今日非阳线'
             return scores
             
-        # 条件2: 交易量是前面至少20天最低量的80%以下
-        # 如果历史数据不足导致 prev_vol_min_20 为空，也直接过滤
-        if pd.isnull(row['prev_vol_min_20']):
+        # 条件3: 今天必须放量 (突然放量)
+        # 定义：量比 > 1.0 (比20日均量大) 且 涨幅 > 2% (有力度)
+        if row['volume'] < row['vol_ma20']:
             scores['总分'] = 0
+            scores['淘汰原因'] = '今日未放量'
             return scores
             
-        limit_vol = row['prev_vol_min_20'] * 0.8
-        if row['volume'] >= limit_vol:
+        if row['pct_change'] < 3.0: # 放宽一点到3%，防止漏掉启动初期
             scores['总分'] = 0
-            scores['淘汰原因'] = '量能未达极致缩量'
+            scores['淘汰原因'] = '涨幅力度不够'
             return scores
 
         # ==========================================
-        # === 1. 核心条件 (50分) ===
+        # === 1. 爆发力度评分 (40分) ===
         # ==========================================
+        breakout_score = 0
         
-        # A. 最低量分 (40分)
-        # 能走到这里，说明已经满足了 < 80% 前低，这是非常极致的信号，直接给高分
-        # 我们根据缩得有多厉害再细分一下
-        vol_score = 40
-        ratio = row['volume'] / row['prev_vol_min_20'] # 必然小于 0.8
+        # 涨幅越大越好 (大阳线)
+        if row['pct_change'] >= 9.0: breakout_score = 40  # 涨停或接近涨停
+        elif row['pct_change'] >= 6.0: breakout_score = 35
+        elif row['pct_change'] >= 4.0: breakout_score = 25
+        else: breakout_score = 15
         
-        if ratio <= 0.5: vol_score = 40      # 缩量一半以上，极度惜售
-        elif ratio <= 0.6: vol_score = 38
-        elif ratio <= 0.7: vol_score = 35
-        else: vol_score = 30                 # 0.7-0.8之间
-        
-        scores['最低量分'] = vol_score
-        
-        # B. 下跌幅度分 (10分)
-        # 已经是绿盘了，看跌多少。通常极致缩量伴随小跌或急跌
-        drop_score = 0
-        pct = row['pct_change']
-        if -2 <= pct < 0: drop_score = 10    # 阴跌/小跌 最好
-        elif -4 <= pct < -2: drop_score = 8  # 中跌
-        elif pct < -4: drop_score = 5        # 大跌
-        scores['下跌分'] = drop_score
-        
-        scores['核心条件分'] = vol_score + drop_score
+        scores['爆发力度分'] = breakout_score
 
         # ==========================================
-        # === 2. 趋势条件 (15分) ===
+        # === 2. 放量程度评分 (30分) ===
+        # ==========================================
+        vol_score = 0
+        # 与5日均量对比，看是否"突然"
+        vol_ratio_5 = row['volume'] / row['vol_ma5'] if row['vol_ma5'] > 0 else 0
+        
+        if vol_ratio_5 >= 2.0: vol_score = 30     # 倍量
+        elif vol_ratio_5 >= 1.5: vol_score = 25   # 明显放量
+        elif vol_ratio_5 >= 1.2: vol_score = 15
+        else: vol_score = 10
+        
+        scores['放量分'] = vol_score
+
+        # ==========================================
+        # === 3. 趋势位置评分 (20分) ===
         # ==========================================
         trend_score = 0
-        if pd.notnull(row['distance_ma60']):
-            # 这种极致缩量，通常发生在回调到底部时
-            if row['distance_ma60'] < 0:
-                abs_dist = abs(row['distance_ma60'])
-                if abs_dist >= 10: trend_score = 15 # 乖离率较大，超跌
-                elif abs_dist >= 5: trend_score = 12
-                else: trend_score = 8
-            else:
-                # 均线上方缩量回踩
-                trend_score = 10 
+        # 这种策略最好是在低位启动，或者突破均线
+        
+        # 是否突破20日线
+        if row['open'] < row['ma_20'] and row['close'] > row['ma_20']:
+            trend_score += 10
+        
+        # 价格位置：如果在60日线下方较远，属于超跌反弹；如果刚突破60日线，属于反转
+        dist_60 = (row['close'] - row['ma_60']) / row['ma_60'] * 100
+        if -15 < dist_60 < 5: # 在60日线附近或下方不远处
+             trend_score += 10
+             
         scores['趋势分'] = trend_score
 
         # ==========================================
-        # === 3. 波动条件 (10分) ===
-        # ==========================================
-        # 缩量通常意味着波动率下降
-        volatility_score = 0
-        if pd.notnull(row['amp_ma15']):
-            if row['amp_ma15'] < 3.0: volatility_score = 10
-            elif row['amp_ma15'] < 4.5: volatility_score = 6
-            else: volatility_score = 3
-        scores['波动分'] = volatility_score
-
-        # ==========================================
-        # === 4. 价格条件 (10分) ===
-        # ==========================================
-        price_score = 0
-        if 3 < row['close'] <= 30: price_score = 10 # 偏好中小盘低价
-        elif 30 < row['close'] <= 80: price_score = 5
-        scores['价格分'] = price_score
-
-        # ==========================================
-        # === 5. 额外加分 (15分) ===
+        # === 4. 额外加分 (10分) ===
         # ==========================================
         extra_score = 0
-        # 实体很小（十字星类）加分
-        body_size = abs(row['close'] - row['open']) / row['open'] * 100
-        if body_size < 1.0: extra_score += 5
         
-        # 如果是长下影线（探底回升）加分
-        lower_shadow = (min(row['open'], row['close']) - row['low']) / row['low'] * 100
-        if lower_shadow > 1.5: extra_score += 5
+        # 实体饱满 (光头光脚更好)
+        upper_shadow = (row['high'] - row['close']) / row['close'] * 100
+        if upper_shadow < 0.5: extra_score += 5 # 几乎无上影线，做多意愿强
         
-        # 量比特别小
-        if row['vol_ratio'] < 0.6: extra_score += 5
+        # 缩量日离今天越近越好？或者越久越好？
+        # 这里假设缩量后快速反弹比较好，不做具体加分，仅作逻辑参考
         
-        scores['额外分'] = min(15, extra_score)
+        # 价格适中
+        if 5 < row['close'] < 50: extra_score += 5
         
-        total = scores['核心条件分'] + trend_score + volatility_score + price_score + scores['额外分']
+        scores['额外分'] = extra_score
+        
+        total = breakout_score + vol_score + trend_score + extra_score
         scores['总分'] = min(100, total)
-        
-        # 记录关键数值供显示
-        scores['_ratio_val'] = ratio # 记录缩量比例 
         
         return scores
 
@@ -186,13 +176,12 @@ class WeightedScoringStrategy:
         
         final_df = pd.DataFrame(results).sort_values('总分', ascending=False)
         
-        # 构造推送到手机的理由字符串
-        # 显示格式：得分 | 现量/前20低占比 | 跌幅
+        # 构造理由
         final_df['reason'] = final_df.apply(
-            lambda x: f"极致缩量{x['总分']}分|是前低的:{x['_ratio_val']:.2f}倍|跌:{x['pct_change']:.1f}%", 
+            lambda x: f"缩量后起爆{x['总分']}分|涨:{x['pct_change']:.1f}%|量比5日:{x['volume']/x['vol_ma5']:.1f}倍", 
             axis=1
         )
         return final_df
 
 def run_strategy(df):
-    return WeightedScoringStrategy().run(df)
+    return ShrinkBreakoutStrategy().run(df)
