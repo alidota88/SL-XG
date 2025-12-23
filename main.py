@@ -86,7 +86,7 @@ def main():
         print(f"❌ Critical Error: {e}")
         send_telegram(f"❌ 程序运行报错: {e}")
 
-    schedule.every().day.at("08:30").do(execute_logic)
+    schedule.every().day.at("16:30").do(execute_logic)
     
     while True:
         schedule.run_pending()
